@@ -1,76 +1,65 @@
-# Content
+# Button debouncer using the Raspberry Pico PIO 
 
-This repository contains bits and pieces that I made while trying to figure out how the Raspberry Pi Pico state machines and the Programmable Input/Output (PIO) work.
+## Update 
 
-[Here](https://github.com/GitJer/Some_RPI-Pico_stuff/tree/main/handy_bits_and_pieces) I have written down the reusable 'tricks' I use in several of the projects listed below.
+The new version allows the use of all 8 PIO state machines, and thus debounce up to 8 gpio.
 
-The following projects are contained in this repository:
+It also allows setting of the debounce time between 0.5 to 30 ms.
 
-## State machine emulator
-The problem with the state machines is that debuggers do not give the insight I need when writing code for a sm. I typically write some code, upload it to the pico and find that it doesn't do what I want it to do. Instead of guessing what I do wrong, I would like to see the values of e.g. the registers when the sm is executing. So, I made an [emulator](https://github.com/GitJer/Some_RPI-Pico_stuff/tree/main/state_machine_emulator).
 
-## Two independently running state machines 
-[This](https://github.com/GitJer/Some_RPI-Pico_stuff/tree/main/Two_sm_simple) is just an example of two state machines running independently. Nothing special about it, but I had to do it.
+## Original text
 
-## Two independently running state machines, one gets disabled temporarily
-[This](https://github.com/GitJer/Some_RPI-Pico_stuff/tree/main/Two_sm_one_disabled) is an example of two state machines running independently, but one gets disabled temporarily.
+When using a GPIO to read noisy input, such as a mechanical button, it may happen that the signal read by the microcontroller rapidly switches back and forth, which may lead to false detection of several button presses where only one was intended. To prevent this, some hardware solutions exist as well as software solutions. This project is a software debouncer that makes sure that only after the input signal has stabilized, the code will read the new value. The downside of debouncers is that they usually cost some processing time to function. For Arduino a simple debouncer can be found [here](https://www.arduino.cc/en/Tutorial/BuiltInExamples/Debounce).
 
-## Two independently running state machines, synchronized via irq, one gets disabled temporarily
-[This](https://github.com/GitJer/Some_RPI-Pico_stuff/tree/main/Two_sm_one_disabled_with_irq) is an example of two state machines synchronized via setting and clearing an irq, one gets disabled temporarily.
+The nice thing about the [Raspberry Pico](https://www.raspberrypi.org/documentation/pico/getting-started) is that it has 8 programmable IO (PIO) blocks that work independent of the main cores. I wanted to try my hand at programming the PIO and decided to do something I hadn't already seen as an example: a debouncer. The debouncer runs on one of the state machines of a PIO instance (there are two PIO instances and each has 4 state machines.)
 
-## State machine writes into a buffer via DMA
-[This](https://github.com/GitJer/Some_RPI-Pico_stuff/tree/main/sm_to_dma_to_buffer) is an example of a state machine using DMA (Direct Memory Access) to write into a buffer.
+The c++ code contains a class that starts the PIO code and lets the user code read the debounced pin state. The PIO code is as follows:
 
-## State Machine -> DMA -> State Machine -> DMA -> Buffer
-[This](https://github.com/GitJer/Some_RPI-Pico_stuff/tree/main/sm_to_dma_to_sm_to_dma_to_buffer) is an example where one state machine writes via DMA to another state machine whose output is put into a buffer via another DMA channel.
+        jmp pin isone     ; executed only once: is the pin currently 0 or 1?
+    iszero:
+        wait 1 pin 0      ; the pin is 0, wait for it to become 1
+        set x 31          ; prepare to test the pin for 31 times
+    checkzero:
+        jmp pin stillone  ; check if the pin is still 1
+        jmp iszero        ; if the pin has returned to 0, start over
+    stillone:
+        jmp x-- checkzero ; decrease the time to wait, or the pin has definitively become 1
+    isone:
+        wait 0 pin 0      ; the pin is 1, wait for it to become 0
+        set x 31          ; prepare to test the pin for 31 times
+    checkone:
+        jmp pin isone     ; if the pin has returned to 1, start over
+        jmp x-- checkone  ; decrease the time to wait
+        jmp iszero        ; the pin has definitively become 0
 
-## Communicating values between state machines 
-The [RP2040 Datasheet](https://datasheets.raspberrypi.org/rp2040/rp2040-datasheet.pdf) states that "State machines can not communicate data". Or can they ... Yes they can, in several ways, [including via GPIO pins](https://github.com/GitJer/Some_RPI-Pico_stuff/tree/main/Value_communication_between_two_sm_via_pins).
 
-## Use the ISR for rotational shifting
-Normally if the ISR shifts via the `IN` instruction, the bits that come out of the ISR go to cyber space, never to be heard from again. Sometimes it is handy to have rotational shifting. [Right shifting works fine, but left shifting needs some trickery](https://github.com/GitJer/Some_RPI-Pico_stuff/tree/main/Rotational_shift_ISR).
+## Explanation of PIO code
+* Start with the assumption that the pin is in a steady state.
+  If it is currently 1, then go to 'isone'; if it is currently 0, then go to 'iszero'
+* The code after 'isone' works as follows:
+  * Since the pin is 1 wait for a change to 0
+  * If that happens, set 31 into the x scratch register
+    * This is the amount of 'time' the debouncer will wait before switching over. The actual amount of time is also dependent on the clock divisor, and the fact that two jmp statements are executed for a test. Edit: in the updated version the debounce time can be set in ms.
+  * The program keeps checking if the input changes back to 1; and if so, start over at 'isone'
+  * If the input does not change back, complete the loop of counting down from 31
+  * If the x scratch register becomes 0, the signal has definitively switched to 0; start from 'iszero'
+* The branch of 'iszero' works similarly, but is structured a little bit differently because the `jmp pin` statement jumps on 1, not 0
 
-## 4x4 button matrix using PIO code
-[This code](https://github.com/GitJer/Some_RPI-Pico_stuff/tree/main/button_matrix_4x4) reads a 4x4 button matrix using PIO code for the Raspberry Pico and returns the button pressed.
+There is one more important aspect to consider: the user code needs to read the debounced pin. So, somehow information from the PIO state machine has to go to the user code. I have considered several options:
+* Use the FIFO much like the [uart_rx](https://github.com/raspberrypi/pico-examples/tree/master/pio/uart_rx) example code
+* Use the FIFO, but from the PIO code make it empty (IN NULL) for a 0 and fill it with something to indicate a 1, and test the FIFO content with pio_sm_get_rx_fifo_level, or pio_sm_is_rx_fifo_empty
+* Use an interrupt, e.g. PIO0_IRQ_0 for a 0, and PIO0_IRQ_1 for a 1
+* Use an interesting approach where no explicit communication between the user code and PIO code is used at all!
 
-## Button debouncer using PIO code
-When using a GPIO to read noisy input, such as a mechanical button, a [software debouncer](https://github.com/GitJer/Some_RPI-Pico_stuff/tree/main/Button-debouncer) makes sure that only after the input signal has stabilized, the code will read the new value. 
+The option I chose is based on the fact that the user code can know where the PIO state machine program counter is during execution via `pio_sm_get_pc`. The debouncer code has a clear split between the part where the debounced value is 0 and the part where it is 1: If (offset+1 <= pc < offset+isone) the value is 0, if (pc >= offset+isone) the value is 1, where offset is the starting point of the program in the PIO memory, and pc is the program counter.
 
-## PWM input using PIO code
-Most microcontrollers have hardware to produce Pulse Width Modulation (PWM) signals. But sometimes it is useful to be able to [read PWM signals](https://github.com/GitJer/Some_RPI-Pico_stuff/tree/main/PwmIn) and determine the period, pulse width and duty cycle.
+This approach keeps the code very small, and reading the debounced state is very quick.
 
-## Rotary encoder using PIO code
-[This software](https://github.com/GitJer/Some_RPI-Pico_stuff/tree/main/Rotary_encoder) reads an optical rotary encoder with very clean signals on its output using PIO code.
+## Does it actually work
+Yes, it does. To show that the debouncer works, I have used another microcontroller to generate a repeating signal that bounces up and down a couple of times. In the figure below I have used a slightly different PIO code that sets a GPIO to 0 or 1 depending on the debounced state.
 
-## HC-SR04 using the PIO code
-[This code](https://github.com/GitJer/Some_RPI-Pico_stuff/tree/main/HCSR04) reads the HC-SR04, an ultrasonic distance measurement unit.
+![](debounce_test.png)
 
-## Ws2812 led strip with 120 pixels 
-[This code](https://github.com/GitJer/Some_RPI-Pico_stuff/tree/main/ws2812_led_strip_120) is my take on how to control a ws2812 led strip with 120 pixels
+The blue line is the raw input signal. It bounces up and down a couple of times between point (a) and (b). The yellow line is the debounced pin state. It clearly follows the blue line, but skips over the bounces.
 
-## multiply two numbers 
-[This code](https://github.com/GitJer/Some_RPI-Pico_stuff/tree/main/multiplication) multiplies two numbers.
-
-## Two pio programs in one file
-I wanted to see how I could use two pio programs in one file and use them from within the c/c++ program, see [here.](https://github.com/GitJer/Some_RPI-Pico_stuff/tree/main/two_pio_programs_one_file) 
-
-## 1-wire protocol for one device 
-[This code](https://github.com/GitJer/Some_RPI-Pico_stuff/tree/main/Limited_1_wire) is a pio implementation of the 1-wire protocol.
-
-## Blow out a(n) LED
-[This code](https://github.com/GitJer/Some_RPI-Pico_stuff/tree/main/blow_out_a_LED) is a remake of the wonderfull little thingy made by Paul Dietz: blow on a LED to make it go out! Really!
-
-## Counting pulses in a pulse train separated by a pause 
-[This code](https://github.com/GitJer/Some_RPI-Pico_stuff/tree/main/count_pulses_with_pause) can be used for protocols where the data is encoded by a number of pulses in a pulse train followed by a pause.
-E.g. the LMT01 temperature sensor uses this, [see](https://www.reddit.com/r/raspberrypipico/comments/nis1ew/made_a_pulse_counter_for_the_lmt01_temperature/).
-
-## Subroutines in pioasm
-[This code](https://github.com/GitJer/Some_RPI-Pico_stuff/tree/main/subroutines) shows that subroutines in pioasm can be a thing and can - in some cases - be used to do more with the limited memory space than is possible with just writing the code in one program.
-
-## Read the SBUS protocol with (and without!) pio code
-The SBUS protocol is typically used in Radio Controlled cars, drones, etc. If you want to read this protocol from a RC receiver in order to manipulate the data before setting motors and servos, you can use [this code](https://github.com/GitJer/Some_RPI-Pico_stuff/tree/main/SBUS).
-
-## LED panel using PIO state machine and Direct Memory Access
-[This code](https://github.com/GitJer/Some_RPI-Pico_stuff/tree/main/ledpanel) shows how a pio state machine can drive led panels. It is made for
-two 64x64 led panels connected to form a 64 row x 128 column panel. There are 16 brightness levels for each Red, Green and Blue of each pixel, allowing many 
-colors. In its present form it updates the panel at about 144 Hz at standard clock settings (=125MHz.)
+If the debouncing time is chosen too small the yellow line simply follows the blue line including the bounces, but with a slight delay.
